@@ -1,0 +1,18 @@
+# Ambiente virtuale
+.venv/
+venv/
+
+# Bytecode Python
+__pycache__/
+*.pyc
+
+# Cache delle richieste OpenStreetMap (osmnx) - si riscarica da sola
+cache/
+
+# Mappe scaricate e output generati (pesanti, si rigenerano eseguendo il programma)
+mappe/
+risultati/
+
+# File di sistema / editor
+.DS_Store
+.vscode/
