@@ -27,10 +27,10 @@ video dell'esplorazione.
 
 | File | Descrizione |
 |------|-------------|
-| `a_star.py` | Algoritmo A\* e calcolo del fattore di ramificazione effettivo *b\**. |
-| `heuristics.py` | Le tre euristiche (zero, euclidea, landmark). |
+| `algoritmi.py` | Algoritmo A\*, Greedy e BFS e calcolo del fattore di ramificazione effettivo *b\**. |
+| `heuristics.py` | Le quattro euristiche (zero, euclidea, euclidea pesata w=2,landmark ALT). |
 | `video.py` | Generazione dei video MP4 dell'esplorazione. |
-| `main.py` | Programma principale: input utente, confronto euristiche, output. |
+| `driver.py` | Programma principale: input utente, confronto euristiche, output. |
 | `requirements.txt` | Dipendenze Python. |
 
 Le cartelle `mappe/` (grafi scaricati) e `risultati/` (immagini e video) vengono
