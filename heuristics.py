@@ -1,156 +1,525 @@
+import os
+import re
+import csv
 import math
 import random
+import statistics
 
-import networkx as nx
+import osmnx as ox
+import matplotlib
+matplotlib.use("Agg")          # backend senza finestre: salva su file invece di aprire
+                               # una GUI. Va impostato PRIMA di importare pyplot.
+import matplotlib.pyplot as plt
+
+from algoritmi import a_star, effective_branching_factor, greedy, bfs
+from heuristics import (make_h_zero, make_h_euclidean, make_h_landmark,
+                        make_h_weighted, _metri_per_grado_lat, _metri_per_grado_lon)
+from video import anima_esplorazione
 
 
-# 1. EURISTICA NULLA
-def make_h_zero():
-    """Euristica zero: A* degenera in Dijkstra. Baseline di confronto."""
-    def h(node, goal):
-        return 0.0
-    return h
+# ============================================================
+# CONFIGURAZIONE
+# ============================================================
+CARTELLA_MAPPE = "mappe"
+CARTELLA_RISULTATI = "risultati"
+
+K_LANDMARK = 8      # landmark precalcolati per l'euristica ALT.
+                    # Piu' landmark = euristica piu' informata, MA preprocessing
+                    # piu' lungo (2*K Dijkstra completi) e piu' memoria.
+N_ATTIVI = 3        # quanti landmark usare davvero per ogni coppia (start, goal).
+                    # Riduce il costo per nodo senza perdere quasi informativita'.
+W = 2.0             # peso dell'euristica pesata. w > 1 -> inammissibile per
+                    # costruzione: perde l'ottimalita', guadagna velocita'.
+
+# Bin di distanza in linea d'aria (km). Vanno tarati sulla dimensione della citta':
+# per Napoli (~12 km di estensione) servono bin fino a 12; per Torre del Greco
+# basterebbe fermarsi a 6, altrimenti gli ultimi bin resterebbero vuoti.
+BIN_KM = [(0.5, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12)]
+COPPIE_PER_BIN = 20   # piu' coppie = mediane piu' stabili, ma benchmark piu' lento
+SEED = 42             # seed fisso: gli esperimenti devono essere RIPRODUCIBILI
 
 
-# 2. DISTANZA IN LINEA D'ARIA
-def _metri_per_grado_lat(lat_deg):
+# ============================================================
+# CARICAMENTO MAPPA
+# ============================================================
+def _nome_file(luogo):
+    """Trasforma il nome di un luogo in un nome di file sicuro (slug)."""
+    # "Napoli, Italy" -> "napoli_italy". La regex sostituisce ogni sequenza di
+    # caratteri NON alfanumerici con un underscore; strip("_") toglie quelli
+    # eventualmente rimasti agli estremi. Serve perche' virgole e spazi sono
+    # pessimi nomi di file.
+    slug = re.sub(r"[^a-z0-9]+", "_", luogo.lower()).strip("_")
+    return os.path.join(CARTELLA_MAPPE, f"{slug}.graphml")
+
+
+def carica_grafo():
     """
-    Metri per grado di latitudine ALLA LATITUDINE DATA (WGS84).
+    Carica il grafo dalla cartella 'mappe/' se gia' scaricato, altrimenti lo
+    scarica da OSM e lo salva. Ripete finche' il luogo non viene trovato.
     """
-    p = math.radians(lat_deg)
-    return 111132.92 - 559.82 * math.cos(2 * p) + 1.175 * math.cos(4 * p)
+    os.makedirs(CARTELLA_MAPPE, exist_ok=True)   # exist_ok: non fallisce se c'e' gia'
+
+    while True:   # si ripete finche' l'utente non inserisce un luogo valido
+        luogo = input("Città o area da caricare (es. 'Torre del Greco, Italy'): ").strip()
+        if not luogo:
+            print("Il campo non può essere vuoto.")
+            continue
+
+        percorso = _nome_file(luogo)
+
+        # CACHE SU DISCO. Le API di OpenStreetMap hanno rate limiting e il download
+        # di una citta' richiede decine di secondi: riscaricare a ogni avvio sarebbe
+        # lento e scortese verso i loro server.
+        if os.path.exists(percorso):
+            print(f"Carico la mappa da '{percorso}' (nessun download necessario)...")
+            graph = ox.load_graphml(percorso)
+        else:
+            print(f"Download della mappa in corso ({luogo})...")
+            try:
+                # network_type="drive": solo strade percorribili in AUTO (niente
+                # sentieri, scale, piste ciclabili). E' anche cio' che rende il grafo
+                # ORIENTATO: OSMnx legge il tag 'oneway' e per i sensi unici crea un
+                # solo arco, nella direzione consentita.
+                graph = ox.graph_from_place(luogo, network_type="drive")
+            except Exception:
+                # Nominatim non ha trovato il luogo: si riprova invece di crashare.
+                print(f"  Luogo non trovato: '{luogo}'. Prova ad essere più preciso "
+                      f"(es. aggiungi la nazione: 'Napoli, Italy').")
+                continue
+            ox.save_graphml(graph, percorso)
+            print(f"Mappa salvata in locale come '{percorso}'.")
+
+        # Componente FORTEMENTE connessa piu' grande: il grafo grezzo di OSM ha
+        # frammenti isolati e nodi senza uscita, che renderebbero irraggiungibili
+        # alcune coppie (start, goal) e farebbero fallire il benchmark.
+        # "Fortemente" (e non semplicemente "connessa") perche' il grafo e' diretto:
+        # serve che da ogni nodo si raggiunga ogni altro SEGUENDO IL VERSO degli archi.
+        graph = ox.truncate.largest_component(graph, strongly=True)
+        return graph, luogo
 
 
-def _metri_per_grado_lon(lat_deg):
-    """Metri per grado di longitudine alla latitudine data (i meridiani convergono)."""
-    p = math.radians(lat_deg)
-    return 111412.84 * math.cos(p) - 93.5 * math.cos(3 * p)
+def chiedi_nodo(graph, etichetta):
+    """Geocodifica un indirizzo con Nominatim e restituisce il nodo piu' vicino."""
+    while True:
+        query = input(f"{etichetta} (via, indirizzo o punto di interesse): ").strip()
+        if not query:
+            print("Il campo non può essere vuoto.")
+            continue
+        try:
+            # ox.geocode restituisce la coppia (LATITUDINE, LONGITUDINE), in
+            # quest'ordine. Attenzione: nearest_nodes vuole invece i parametri
+            # nominati X=longitudine, Y=latitudine. Invertirli non da' errore:
+            # restituisce silenziosamente un nodo a caso dall'altra parte del mondo.
+            y, x = ox.geocode(query)
+        except Exception:
+            print(f"  Non trovato: '{query}'. Prova ad essere più preciso.")
+            continue
+        print(f"  Trovato: lat={y:.5f}, lon={x:.5f}")
+
+        # Le coordinate geocodificate quasi mai coincidono con un nodo del grafo:
+        # i nodi sono gli INCROCI, mentre un indirizzo sta a meta' di una strada.
+        # nearest_nodes fa lo "snapping" all'incrocio piu' vicino.
+        return ox.nearest_nodes(graph, X=x, Y=y)
 
 
-def make_h_euclidean(graph):
+# ============================================================
+# REGISTRO DEGLI ALGORITMI
+# ============================================================
+def costruisci_algoritmi(G):
     """
-    Distanza in linea d'aria su proiezione equirettangolare locale.
-    Ammissibile: la strada tra due punti non e' mai piu' corta della linea d'aria.
-    Consistente: la distanza euclidea soddisfa la disuguaglianza triangolare.
+    Costruisce le euristiche (una volta sola: il preprocessing ALT e' costoso)
+    e restituisce un dizionario nome -> funzione(start, goal, on_expand).
+
+    Le lambda uniformano le firme diverse (a_star e greedy vogliono l'euristica,
+    bfs no), cosi' il ciclo di esecuzione resta uno solo.
     """
-    # cache delle coordinate: evita un lookup nel grafo a ogni chiamata di h
-    pos = {n: (d["y"], d["x"]) for n, d in graph.nodes(data=True)}
+    print(f"\nPreprocessing euristica ALT ({K_LANDMARK} landmark, "
+          f"{2 * K_LANDMARK} Dijkstra completi)...")
 
-    def h(node, goal):
-        y1, x1 = pos[node]
-        y2, x2 = pos[goal]
-        lat_media = (y1 + y2) / 2
-        dy = (y1 - y2) * _metri_per_grado_lat(lat_media)
-        dx = (x1 - x2) * _metri_per_grado_lon(lat_media)
-        return math.hypot(dx, dy)
+    # Le euristiche si costruiscono QUI, FUORI dal ciclo sulle coppie. Non e'
+    # un'ottimizzazione: e' l'unica cosa che rende il benchmark eseguibile. Il
+    # preprocessing di ALT (2*K Dijkstra completi) ripetuto per ognuna delle
+    # centinaia di coppie richiederebbe ore.
+    h_zero = make_h_zero()
+    h_eucl = make_h_euclidean(G)
+    h_alt = make_h_landmark(G, k=K_LANDMARK, n_attivi=N_ATTIVI, seed=SEED)
+    h_pes = make_h_weighted(h_eucl, W)   # e' h_eucl moltiplicata per W
+    print("Preprocessing completato.")
 
-    return h
+    # DIZIONARIO nome -> funzione. Le lambda sono CLOSURE: catturano G e l'euristica
+    # dall'ambiente e se le portano dietro, cosi' dall'esterno tutte e sei accettano
+    # la stessa firma (start, goal, on_expand) e il ciclo di esecuzione non ha bisogno
+    # di alcun "if". oe=None ha un default perche' in benchmark il callback non serve.
+    #
+    # ORDINE IMPORTANTE: Dijkstra deve stare PER PRIMO, perche' esegui_tutti usa il
+    # primo risultato come riferimento di ottimalita'.
+    algoritmi = {
+        "A* Zero (Dijkstra)": lambda s, g, oe=None: a_star(G, h_zero, s, g, on_expand=oe),
+        "A* Euclidea":        lambda s, g, oe=None: a_star(G, h_eucl, s, g, on_expand=oe),
+        "A* Landmark (ALT)":  lambda s, g, oe=None: a_star(G, h_alt, s, g, on_expand=oe),
+        # f-string: {W:g} stampa "2" invece di "2.0" (il formato 'g' toglie gli zeri
+        # inutili). Cosi' la chiave si adegua da sola se cambi la costante W.
+        f"A* Pesata (w={W:g})": lambda s, g, oe=None: a_star(G, h_pes, s, g, on_expand=oe),
+        "Greedy":             lambda s, g, oe=None: greedy(G, h_eucl, s, g, on_expand=oe),
+        "BFS":                lambda s, g, oe=None: bfs(G, s, g, on_expand=oe),
+    }
+    return algoritmi, h_alt
 
 
-# 3. EURISTICA PESATA  (Weighted A*)
-def make_h_weighted(h_base, w):
+def esegui_tutti(algoritmi, h_alt, start, goal, raccogli_espansi=False):
     """
-    f = g + w*h.  Per w > 1 l'euristica NON e' piu' ammissibile: A* perde
-    l'ottimalita' ma espande molti meno nodi. Il costo trovato resta comunque
-    garantito entro un fattore w dall'ottimo (w-ammissibilita').
+    Esegue tutti gli algoritmi sulla STESSA coppia (confronto appaiato: elimina
+    la variabilita' dovuta alla scelta di start/goal).
+
+    Restituisce (lista_risultati, percorso_ottimo). Il riferimento di ottimalita'
+    e' il costo di Dijkstra, che e' il primo della lista ed e' garantito ottimo.
     """
-    def h(node, goal):
-        return w * h_base(node, goal)
-    return h
+    # ALT sceglie i landmark "attivi" in base alla coppia: va fatto una volta
+    # sola prima della ricerca, non a ogni nodo.
+    h_alt.preprocess(start, goal)
+
+    risultati = []
+    costo_ottimo = None
+    percorso_ottimo = None
+
+    for nome, fn in algoritmi.items():
+        # In benchmark NON raccogliamo l'ordine di espansione: farlo per centinaia
+        # di run significherebbe accumulare liste da decine di migliaia di nodi
+        # ciascuna, per poi buttarle. Serve solo in demo, per i video.
+        espansi = [] if raccogli_espansi else None
+        cb = espansi.append if raccogli_espansi else None
+
+        path, cost, m = fn(start, goal, cb)
+
+        if path is None:
+            # Coppia irraggiungibile. Non dovrebbe capitare dopo largest_component,
+            # ma se capita scartiamo l'INTERA coppia: tenere solo alcuni algoritmi
+            # romperebbe il confronto appaiato.
+            return None, None
+
+        if costo_ottimo is None:
+            # Prima iterazione = Dijkstra (vedi ordine del dizionario). Il suo costo
+            # e' l'ottimo garantito, e diventa il riferimento per l'errore di tutti
+            # gli altri.
+            costo_ottimo = cost
+            percorso_ottimo = path
+
+        risultati.append({
+            "algoritmo": nome,
+            "costo_m": cost,
+            # Errore relativo rispetto all'ottimo. Vale 0 per gli algoritmi ottimi
+            # (Dijkstra, A* euclidea, A* ALT) e > 0 per gli altri.
+            "errore_%": 100 * (cost - costo_ottimo) / costo_ottimo,
+            # Numero di ARCHI (non di nodi). Questa colonna esiste per rendere
+            # leggibile BFS: senza, il suo costo alto sembra solo un fallimento, e
+            # non si vede che sul numero di archi e' invece OTTIMO.
+            "archi_path": m["path_len"] - 1,
+            "nodi_espansi": m["expanded_nodes"],
+            "tempo_ms": m["time_s"] * 1000,
+            "picco_frontiera": m["peak_frontier"],
+            "b_star": effective_branching_factor(m["expanded_nodes"], m["path_len"] - 1),
+            "path": path,        # serve solo alla demo (disegno mappa, video)
+            "espansi": espansi,  # idem
+        })
+
+    return risultati, percorso_ottimo
 
 
-# 4. LANDMARK / ALT
-def scegli_landmark_farthest(graph, k, seed=42):
+# ============================================================
+# MODALITA' 1 — DEMO SU UNA SINGOLA COPPIA
+# ============================================================
+def modalita_demo(G, algoritmi, h_alt):
+    """Una coppia scelta dall'utente: tabella + video + immagini + grafici a barre."""
+    start = chiedi_nodo(G, "Punto di partenza")
+    goal = chiedi_nodo(G, "Punto di arrivo")
+
+    # raccogli_espansi=True: qui SERVE l'ordine di espansione, per animare i video.
+    risultati, percorso_ottimo = esegui_tutti(algoritmi, h_alt, start, goal,
+                                              raccogli_espansi=True)
+    if risultati is None:
+        print("Nessun percorso tra i due punti.")
+        return
+
+    # --- tabella a terminale ---
+    # b* si stampa con 6 decimali: su percorsi lunghi tutti i valori si schiacciano
+    # tra 1.00 e 1.03, e con 2 decimali sembrerebbero identici.
+    print(f"\n{'algoritmo':22}{'costo (m)':>11}{'err %':>8}{'archi':>7}"
+          f"{'espansi':>10}{'ms':>9}{'picco':>8}{'b*':>11}")
+    print("-" * 86)
+    for r in risultati:
+        print(f"{r['algoritmo']:22}{r['costo_m']:>11.0f}{r['errore_%']:>+8.2f}"
+              f"{r['archi_path']:>7}{r['nodi_espansi']:>10}{r['tempo_ms']:>9.1f}"
+              f"{r['picco_frontiera']:>8}{r['b_star']:>11.6f}")
+
+    os.makedirs(CARTELLA_RISULTATI, exist_ok=True)
+
+    grafici_demo(risultati)
+
+    # --- immagini della mappa ---
+    mappa_file = os.path.join(CARTELLA_RISULTATI, "mappa.png")
+    percorso_file = os.path.join(CARTELLA_RISULTATI, "percorso.png")
+
+    print(f"\nGenerazione di '{mappa_file}'...")
+    # node_size=0: su una citta' i nodi sarebbero decine di migliaia di puntini
+    # illeggibili. edge_linewidth=0.3: strade sottili, cosi' il percorso risalta.
+    ox.plot_graph(G, show=False, save=True, filepath=mappa_file,
+                  node_size=0, edge_linewidth=0.3)
+
+    print(f"Generazione di '{percorso_file}'...")
+    # Si disegna il percorso OTTIMO (quello di Dijkstra), non l'ultimo calcolato:
+    # Greedy, BFS e la pesata restituiscono percorsi subottimi.
+    ox.plot_graph_route(G, percorso_ottimo, show=False, save=True,
+                        filepath=percorso_file, node_size=0, edge_linewidth=0.3,
+                        route_linewidth=1.5, orig_dest_size=20)
+
+    # --- video dell'esplorazione, uno per algoritmo ---
+    for r in risultati:
+        slug = re.sub(r"[^a-z0-9]+", "_", r["algoritmo"].lower()).strip("_")
+        video_file = os.path.join(CARTELLA_RISULTATI, f"esplorazione_{slug}.mp4")
+
+        # CAMPIONAMENTO DEI FRAME. Su Napoli, Dijkstra espande decine di migliaia di
+        # nodi: un frame per nodo renderebbe il video ingestibile (o esaurirebbe la
+        # RAM). Prendiamo un nodo ogni PASSO, per un totale di ~300 frame,
+        # indipendentemente dalla dimensione del grafo.
+        PASSO = max(1, len(r["espansi"]) // 300)
+        frames = r["espansi"][::PASSO]
+
+        print(f"Generazione video '{video_file}' "
+              f"({len(r['espansi'])} nodi -> {len(frames)} frame)...")
+        anima_esplorazione(G, frames, start, goal, r["path"], video_file)
+
+    print(f"\nTutto salvato in '{CARTELLA_RISULTATI}/'.")
+
+
+def grafici_demo(risultati):
     """
-    Selezione 'farthest' (greedy maxmin): i landmark utili stanno ai BORDI
-    del grafo.
-
-    Procedura: parto da un nodo casuale, prendo il piu' lontano da lui, poi
-    ogni volta il nodo che MASSIMIZZA la distanza minima dai landmark gia' scelti.
+    Barre affiancate: le metriche del confronto su una singola coppia.
+    Scala logaritmica dove gli ordini di grandezza sono molto diversi (Dijkstra
+    espande migliaia di nodi, ALT poche centinaia: in scala lineare le barre
+    piccole sparirebbero).
     """
-    rng = random.Random(seed)
-    seme = rng.choice(list(graph.nodes))
+    nomi = [r["algoritmo"] for r in risultati]
 
-    d0 = nx.single_source_dijkstra_path_length(graph, seme, weight="length")
-    landmarks = [max(d0, key=d0.get)]  # il nodo piu' lontano dal seme
+    # (chiave_nel_dizionario, titolo_del_pannello, usare_scala_log?)
+    metriche = [
+        ("nodi_espansi",    "Nodi espansi",                   True),
+        ("tempo_ms",        "Tempo di esecuzione (ms)",       True),
+        ("costo_m",         "Costo del percorso (m)",         False),
+        ("b_star",          "Effective branching factor b*",  False),
+        ("picco_frontiera", "Memoria di picco (frontiera)",   True),
+    ]
 
-    dist_min = dict(nx.single_source_dijkstra_path_length(
-        graph, landmarks[0], weight="length"))
+    fig, axes = plt.subplots(2, 3, figsize=(19, 10))   # 6 riquadri, 5 metriche
 
-    while len(landmarks) < k:
-        cand = max((n for n in dist_min if n not in landmarks),
-                   key=lambda n: dist_min[n], default=None)
-        if cand is None:
-            break
-        landmarks.append(cand)
-        d_new = nx.single_source_dijkstra_path_length(graph, cand, weight="length")
-        for n in dist_min:
-            dist_min[n] = min(dist_min[n], d_new.get(n, float("inf")))
+    # zip si ferma alla lista piu' corta: il sesto 'ax' non viene mai toccato.
+    for ax, (chiave, titolo, log) in zip(axes.flat, metriche):
+        valori = [r[chiave] for r in risultati]
+        ax.bar(range(len(nomi)), valori)
 
-    return landmarks
+        # b* vale ~1.0x per tutti gli algoritmi: partendo da zero, le barre
+        # sarebbero visivamente identiche. Zoomiamo sul range effettivo, cosi'
+        # le differenze (1.019 vs 1.005) diventano leggibili.
+        if chiave == "b_star":
+            lo, hi = min(valori), max(valori)
+            margine = (hi - lo) * 0.15 or 0.001
+            ax.set_ylim(max(1.0, lo - margine), hi + margine)
+
+        ax.set_title(titolo)
+        ax.set_xticks(range(len(nomi)))
+        ax.set_xticklabels(nomi, rotation=30, ha="right", fontsize=8)
+        if log:
+            ax.set_yscale("log")
+        ax.grid(axis="y", alpha=0.3)
+
+    axes.flat[5].axis("off")   # nasconde il sesto riquadro, rimasto senza metrica
+
+    fig.suptitle("Confronto su una singola coppia (start, goal)")
+    fig.tight_layout()
+    out = os.path.join(CARTELLA_RISULTATI, "confronto_singolo.png")
+    fig.savefig(out, dpi=150)
+    plt.close(fig)             # libera la figura: senza, matplotlib accumula memoria
+    print(f"Grafici salvati in '{out}'")
 
 
-def make_h_landmark(graph, landmarks=None, k=8, n_attivi=3, seed=42):
+# ============================================================
+# MODALITA' 2 — BENCHMARK SU DISTANZE CRESCENTI
+# ============================================================
+def distanza_aerea_km(G, u, v):
+    """Distanza in linea d'aria tra due nodi, in km (per assegnare le coppie ai bin)."""
+    y1, x1 = G.nodes[u]["y"], G.nodes[u]["x"]
+    y2, x2 = G.nodes[v]["y"], G.nodes[v]["x"]
+
+    # Stessa proiezione equirettangolare locale usata dall'euristica euclidea:
+    # i gradi vanno convertiti in metri, e il fattore di conversione della
+    # longitudine dipende dalla latitudine (i meridiani convergono).
+    lm = (y1 + y2) / 2
+    dy = (y1 - y2) * _metri_per_grado_lat(lm)
+    dx = (x1 - x2) * _metri_per_grado_lon(lm)
+    return math.hypot(dx, dy) / 1000.0
+
+
+def campiona_coppie(G):
     """
-    Euristica ALT (Goldberg & Harrelson, 2005).
+    Campiona coppie casuali e le assegna ai bin di distanza in linea d'aria.
 
-    Il grafo stradale e' ORIENTATO (sensi unici: 'network_type=drive' crea un
-    solo arco per le vie a senso unico), quindi in generale d(L,v) != d(v,L).
-    Valgono percio' DUE disuguaglianze triangolari distinte:
-
-        d(n,goal) >= d(L,goal) - d(L,n)      -> serve dist_from[L]
-        d(n,goal) >= d(n,L)    - d(goal,L)   -> serve dist_to[L]
-
-    Entrambe sono lower bound validi: h = max su tutti i landmark e su entrambi
-    i bound e' ammissibile (il max di euristiche ammissibili lo e' a sua volta).
-
-    n_attivi: per una data coppia (start, goal) solo pochi landmark danno bound
-    utili. Selezionandoli una volta sola in preprocess() si riduce il costo per
-    nodo senza perdere quasi nulla in informativita'.
+    NOTA METODOLOGICA: la variabile indipendente e' la distanza AEREA, non il
+    numero di nodi espansi. Quest'ultimo e' un RISULTATO dell'algoritmo: usarlo
+    come ascissa sarebbe un ragionamento circolare (staresti misurando i nodi
+    espansi in funzione dei nodi espansi).
     """
-    if landmarks is None:
-        landmarks = scegli_landmark_farthest(graph, k, seed=seed)
+    rng = random.Random(SEED)   # generatore LOCALE con seed fisso: non tocca lo stato
+                                # globale di random, e rende il campionamento riproducibile
+    nodi = list(G.nodes)
+    coppie = {b: [] for b in BIN_KM}
 
-    # d(L, v): Dijkstra sul grafo normale (segue gli archi uscenti)
-    dist_from = {L: nx.single_source_dijkstra_path_length(graph, L, weight="length")
-                 for L in landmarks}
+    # Si estraggono coppie a caso e si vede in quale bin cadono. I bin corti
+    # (0.5-1 km) sono i piu' rari, perche' due nodi presi a caso in una citta'
+    # grande tendono a essere lontani: per questo serve un tetto ampio di tentativi.
+    tentativi, max_tentativi = 0, COPPIE_PER_BIN * len(BIN_KM) * 5000
 
-    # d(v, L): Dijkstra sul grafo TRASPOSTO (segue gli archi entranti).
-    # reverse(copy=False) restituisce una vista: non duplica il grafo in memoria.
-    G_rev = graph.reverse(copy=False)
-    dist_to = {L: nx.single_source_dijkstra_path_length(G_rev, L, weight="length")
-               for L in landmarks}
+    # Ci si ferma quando TUTTI i bin sono pieni, oppure quando si esauriscono
+    # i tentativi (un bin puo' restare vuoto se la citta' e' troppo piccola
+    # per contenere quelle distanze: vedi il commento su BIN_KM).
+    while tentativi < max_tentativi and any(len(v) < COPPIE_PER_BIN for v in coppie.values()):
+        tentativi += 1
+        s, g = rng.sample(nodi, 2)   # due nodi DISTINTI
+        d = distanza_aerea_km(G, s, g)
+        for b in BIN_KM:
+            if b[0] <= d < b[1] and len(coppie[b]) < COPPIE_PER_BIN:
+                coppie[b].append((s, g, d))
+                break   # un bin solo per coppia: i bin non si sovrappongono
 
-    INF = float("inf")
-    stato = {"attivi": landmarks}  # di default: tutti
+    return coppie
 
-    def _bound(L, node, goal):
-        df, dt = dist_from[L], dist_to[L]
-        b = 0.0
-        a1 = df.get(goal, INF) - df.get(node, INF)   # d(L,goal) - d(L,n)
-        a2 = dt.get(node, INF) - dt.get(goal, INF)   # d(n,L)    - d(goal,L)
-        if a1 != INF and a1 > b:
-            b = a1
-        if a2 != INF and a2 > b:
-            b = a2
-        return b
 
-    def preprocess(start, goal):
-        """
-        Da chiamare UNA VOLTA prima di ogni ricerca: tiene solo gli n_attivi
-        landmark che danno il bound migliore per QUESTA coppia (start, goal).
-        """
-        ordinati = sorted(landmarks, key=lambda L: _bound(L, start, goal), reverse=True)
-        stato["attivi"] = ordinati[:n_attivi]
+def modalita_benchmark(G, algoritmi, h_alt):
+    """Molte coppie su distanze crescenti: CSV + grafici a linee con mediana e quartili."""
+    os.makedirs(CARTELLA_RISULTATI, exist_ok=True)
+    coppie = campiona_coppie(G)
+    righe = []   # una riga per (coppia, algoritmo): formato "lungo", comodo per il CSV
 
-    def h(node, goal):
-        best = 0.0
-        for L in stato["attivi"]:
-            b = _bound(L, node, goal)
-            if b > best:
-                best = b
-        return best
+    for b in BIN_KM:
+        print(f"--- bin {b[0]}-{b[1]} km: {len(coppie[b])} coppie ---")
+        for s, g, d_km in coppie[b]:
+            # raccogli_espansi=False: qui i video non servono.
+            risultati, _ = esegui_tutti(algoritmi, h_alt, s, g)
+            if risultati is None:
+                continue    # coppia irraggiungibile: saltata del tutto
 
-    h.landmarks = landmarks
-    h.preprocess = preprocess  
-    return h
+            for r in risultati:
+                righe.append({
+                    "bin": f"{b[0]}-{b[1]}",
+                    "bin_mid": (b[0] + b[1]) / 2,   # ascissa del punto nel grafico
+                    "dist_aerea_km": round(d_km, 3),
+                    "algoritmo": r["algoritmo"],
+                    "costo_m": round(r["costo_m"], 1),
+                    "errore_%": round(r["errore_%"], 2),
+                    "archi_path": r["archi_path"],
+                    "nodi_espansi": r["nodi_espansi"],
+                    "tempo_ms": round(r["tempo_ms"], 3),
+                    "picco_frontiera": r["picco_frontiera"],
+                    "b_star": round(r["b_star"], 6),   # 6 decimali: vedi commento sopra
+                })
+                # NB: 'path' e 'espansi' NON finiscono nel CSV (sarebbero liste
+                # da migliaia di elementi per riga).
+
+    if not righe:
+        print("Nessuna coppia valida campionata.")
+        return
+
+    # --- CSV con i dati GREZZI ---
+    # Vanno allegati alla relazione: permettono a chiunque di rifare l'analisi
+    # (medie, mediane, test statistici) senza rieseguire il benchmark.
+    csv_path = os.path.join(CARTELLA_RISULTATI, "risultati.csv")
+    with open(csv_path, "w", newline="") as f:   # newline="": evita righe vuote su Windows
+        w = csv.DictWriter(f, fieldnames=list(righe[0].keys()))
+        w.writeheader()
+        w.writerows(righe)
+    print(f"\nDati grezzi salvati in '{csv_path}' ({len(righe)} righe)")
+
+    grafici_benchmark(righe)
+
+
+def grafici_benchmark(righe):
+    """
+    Un pannello per metrica, con la distanza aerea sull'asse x.
+
+    Si riportano MEDIANA e BANDA INTERQUARTILE, non la singola run: su rete
+    stradale la varianza tra coppie diverse e' enorme (dipende da dove capitano
+    start e goal rispetto alle arterie principali) e un grafico a singola run
+    sarebbe rumore puro.
+    """
+    # dict.fromkeys preserva l'ordine di inserimento e rimuove i duplicati:
+    # cosi' la legenda segue l'ordine del dizionario degli algoritmi, non uno casuale.
+    algos = list(dict.fromkeys(r["algoritmo"] for r in righe))
+    bins = sorted({r["bin_mid"] for r in righe})
+
+    metriche = [
+        ("nodi_espansi",    "Nodi espansi",                   True),
+        ("tempo_ms",        "Tempo di esecuzione (ms)",       True),
+        ("costo_m",         "Costo del percorso (m)",         False),
+        ("b_star",          "Effective branching factor b*",  False),
+        ("picco_frontiera", "Memoria di picco (frontiera)",   True),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(19, 10))
+
+    for ax, (chiave, titolo, log) in zip(axes.flat, metriche):
+        for a in algos:
+            xs, med, q1s, q3s = [], [], [], []
+
+            for b in bins:
+                # Tutti i valori di QUESTA metrica, per QUESTO algoritmo, in QUESTO bin.
+                # Ordinati, perche' servono i quartili.
+                vals = sorted(r[chiave] for r in righe
+                              if r["algoritmo"] == a and r["bin_mid"] == b)
+                if not vals:
+                    continue   # bin vuoto (citta' troppo piccola per quelle distanze)
+
+                xs.append(b)
+                med.append(statistics.median(vals))
+                q1s.append(vals[len(vals) // 4])         # primo quartile (25%)
+                q3s.append(vals[(3 * len(vals)) // 4])   # terzo quartile (75%)
+
+            ax.plot(xs, med, marker="o", label=a)        # la mediana: la linea
+            ax.fill_between(xs, q1s, q3s, alpha=0.12)    # la dispersione: la banda
+
+        ax.set_title(titolo)
+        ax.set_xlabel("Distanza in linea d'aria (km)")
+        if log:
+            # gli ordini di grandezza tra Dijkstra e ALT sono tali che in scala
+            # lineare le curve degli algoritmi informati sarebbero schiacciate a zero
+            ax.set_yscale("log")
+        ax.grid(alpha=0.3)
+
+    axes.flat[0].legend(fontsize=8)   # una sola legenda, sul primo pannello
+    axes.flat[5].axis("off")          # nasconde il sesto riquadro (5 metriche, 6 posti)
+
+    fig.suptitle("Confronto su distanze crescenti (mediana e banda interquartile)")
+    fig.tight_layout()
+    out = os.path.join(CARTELLA_RISULTATI, "confronto_distanze.png")
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"Grafici salvati in '{out}'")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+if __name__ == "__main__":   # eseguito solo se lanciato direttamente, non se importato
+    G, luogo = carica_grafo()
+    print(f"Mappa pronta: {len(G.nodes)} nodi, {len(G.edges)} archi.")
+
+    # Le euristiche si costruiscono UNA VOLTA, prima di scegliere la modalita':
+    # il preprocessing ALT e' il pezzo piu' costoso dell'intero programma.
+    algoritmi, h_alt = costruisci_algoritmi(G)
+
+    print("\nModalità:")
+    print("  1) Demo   — una coppia scelta da te: tabella, grafici, immagini, video")
+    print("  2) Benchmark — coppie casuali su distanze crescenti: CSV e grafici")
+    scelta = input("Scelta [1/2]: ").strip()
+
+    if scelta == "2":
+        modalita_benchmark(G, algoritmi, h_alt)
+    else:
+        modalita_demo(G, algoritmi, h_alt)
