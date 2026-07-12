@@ -81,7 +81,7 @@ if __name__ == "__main__":
     goal = chiedi_nodo(G, "Punto di arrivo")
 
     # Landmark: qui scelti a caso, meglio sceglierli "ai bordi" del grafo
-    landmarks = random.sample(list(G.nodes), 4)
+    landmarks = random(list(G.nodes), 4)
 
     heuristics = {
         "Zero (Dijkstra)": make_h_zero(),
