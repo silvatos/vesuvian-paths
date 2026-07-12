@@ -62,7 +62,7 @@ generare i video MP4: non serve installare ffmpeg separatamente.
 ## Utilizzo
 
 ```bash
-python main.py
+python driver.py
 ```
 
 Il programma chiede in sequenza:
