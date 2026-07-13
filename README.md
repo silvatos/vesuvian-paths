@@ -5,8 +5,8 @@ Progetto per il corso di **Elementi di Intelligenza Artificiale**.
 Implementazione dell'algoritmo **A\*** per il calcolo del percorso minimo su reti
 stradali reali scaricate da [OpenStreetMap](https://www.openstreetmap.org/)
 tramite [OSMnx](https://osmnx.readthedocs.io/). Il programma confronta tre
-euristiche ammissibili e ne visualizza le differenze con metriche, immagini e
-video dell'esplorazione.
+euristiche ammissibili e ne visualizza le differenze con metriche e immagini
+dei percorsi trovati.
 
 ## Funzionalità
 
@@ -20,8 +20,8 @@ video dell'esplorazione.
 - Scelta interattiva da terminale di **città**, **punto di partenza** e **arrivo**
   (indirizzo, via o punto di interesse), con geocodifica automatica.
 - Salvataggio locale delle mappe scaricate (nessun ri-download alle esecuzioni successive).
-- Generazione di **immagini** (mappa e percorso) e **video MP4** che mostrano
-  l'ordine di esplorazione dei nodi, uno per euristica.
+- Generazione di un'**immagine del percorso ottimo** per ciascun bin di distanza,
+  utile come esempio concreto in documentazione.
 
 ## Struttura del progetto
 
@@ -29,12 +29,11 @@ video dell'esplorazione.
 |------|-------------|
 | `algoritmi.py` | Algoritmo A\*, Greedy e BFS e calcolo del fattore di ramificazione effettivo *b\**. |
 | `heuristics.py` | Le quattro euristiche (zero, euclidea, euclidea pesata w=2,landmark ALT). |
-| `video.py` | Generazione dei video MP4 dell'esplorazione. |
-| `driver.py` | Programma principale: input utente, confronto euristiche, output. |
+| `driver.py` | Programma principale: input utente, confronto euristiche, output, immagini. |
 | `requirements.txt` | Dipendenze Python. |
 
-Le cartelle `mappe/` (grafi scaricati) e `risultati/` (immagini e video) vengono
-create automaticamente all'esecuzione e non sono incluse nel repository.
+Le cartelle `mappe/` (grafi scaricati) e `risultati/` (CSV, grafici e immagini)
+vengono create automaticamente all'esecuzione e non sono incluse nel repository.
 
 ## Installazione
 
@@ -56,9 +55,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Il pacchetto `imageio-ffmpeg` include già il binario di **ffmpeg** necessario a
-generare i video MP4: non serve installare ffmpeg separatamente.
-
 ## Utilizzo
 
 ```bash
@@ -74,12 +70,13 @@ Il programma chiede in sequenza:
 
 Al termine stampa le metriche di confronto e salva in `risultati/`:
 
-- `mappa.png` — la rete stradale;
-- `percorso.png` — la rete con il percorso ottimale evidenziato;
-- `esplorazione_<euristica>.mp4` — un video per euristica con l'ordine di esplorazione.
+- `risultati.csv` — i dati grezzi di tutte le coppie e gli algoritmi;
+- `confronto_distanze.png` — i grafici di confronto tra euristiche;
+- `percorso_bin_<min>_<max>km.png` — il percorso ottimo di una coppia di esempio
+  per ciascun bin di distanza (vedi `BIN_KM` in `driver.py`).
 
 ## Note
 
 - I dati stradali provengono da OpenStreetMap (© contributori OpenStreetMap, licenza ODbL).
-- Su aree molto estese (es. intere città metropolitane) il primo download e la
-  generazione dei video possono richiedere alcuni minuti.
+- Su aree molto estese (es. intere città metropolitane) il primo download può
+  richiedere alcuni minuti.
