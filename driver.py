@@ -311,6 +311,7 @@ def grafici_benchmark(righe):
         ("costo_m",         "Costo del percorso (m)",         False),
         ("b_star",          "Effective branching factor b*",  False),
         ("picco_frontiera", "Memoria di picco (frontiera)",   True),
+        ("errore_%",        "Errore rispetto al costo ottimo (%)", False),
     ]
 
     fig, axes = plt.subplots(2, 3, figsize=(20, 11))
@@ -349,15 +350,16 @@ def grafici_benchmark(righe):
         ax.grid(alpha=0.3)
 
     axes.flat[0].legend(fontsize=8)
-    axes.flat[5].axis("off")
 
     fig.suptitle(f"Confronto su distanze crescenti — {LUOGO}\n"
                  f"(mediana e banda interquartile)")
     fig.tight_layout()
-    out = os.path.join(CARTELLA_RISULTATI, "confronto_distanze.png")
-    fig.savefig(out, dpi=150)
+    out_png = os.path.join(CARTELLA_RISULTATI, "confronto_distanze.png")
+    out_svg = os.path.join(CARTELLA_RISULTATI, "confronto_distanze.svg")
+    fig.savefig(out_png, dpi=150)
+    fig.savefig(out_svg)
     plt.close(fig)
-    print(f"Grafici salvati in '{out}'")
+    print(f"Grafici salvati in '{out_png}' e '{out_svg}'")
 
 
 # ============================================================
